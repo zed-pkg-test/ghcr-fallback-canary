@@ -10,7 +10,7 @@ permissions:
   contents: read
 
 env:
-  ZED_CLI_SHA: f286e574c20ab838b49b3039b1662eff4d5fed85
+  ZED_CLI_SHA: f3123ebebadaede30da97a31a586288c3b15609d
   DEAD_REGISTRY: https://zed-control-plane-intentionally-unavailable.invalid
   ZED_PKG_SOURCE_FALLBACK: 'true'
   ZED_PKG_R2_PUBLIC_BASE: http://127.0.0.1:1
