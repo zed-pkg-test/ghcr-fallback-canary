@@ -11,7 +11,7 @@ permissions:
   packages: write
 
 env:
-  ZED_CLI_SHA: f3123ebebadaede30da97a31a586288c3b15609d
+  ZED_CLI_SHA: 33a95e44aadb418e904c9007eb11952644327efb
 
 jobs:
   ghcr-roundtrip:
