@@ -1,0 +1,139 @@
+name: zed-cli live GHCR roundtrip
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/zed-cli-live-ghcr-roundtrip.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  ZED_CLI_SHA: 7af44a25a0316c57bea89dd8c8da5a782d09a7f3
+
+jobs:
+  ghcr-roundtrip:
+    name: packed Zed layer uploads to GHCR and downloads byte-identically
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out canary
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check out exact zed-cli outage candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: zed-pkg/zed-cli
+          ref: ${{ env.ZED_CLI_SHA }}
+          path: product/zed-cli
+          fetch-depth: 1
+          persist-credentials: false
+          show-progress: false
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: '1.98.1'
+
+      - name: Install live GHCR integration probe into exact candidate checkout
+        run: |
+          set -Eeuo pipefail
+          test "$(git -C product/zed-cli rev-parse HEAD)" = "$ZED_CLI_SHA"
+          mkdir -p product/zed-cli/tests
+          cat > product/zed-cli/tests/ghcr_live_roundtrip.rs <<'RS'
+          use std::fs;
+          use std::path::PathBuf;
+
+          use anyhow::{Context, Result, bail};
+          use sha2::{Digest, Sha256};
+          use zed_cli::github_packages::{GhcrOutcome, download_ghcr_layer, mirror_packed_ghcr};
+          use zed_cli::pack::pack;
+          use zed_interfaces::manifest::Manifest;
+          use zed_interfaces::source::{ghcr_manifest_url, parse_github_identity};
+
+          fn hex_sha256(bytes: &[u8]) -> String {
+              hex::encode(Sha256::digest(bytes))
+          }
+
+          #[test]
+          fn live_ghcr_roundtrip_preserves_packed_zed_bytes() -> Result<()> {
+              let token = std::env::var("GITHUB_TOKEN").context("GITHUB_TOKEN is required")?;
+              if token.trim().is_empty() {
+                  bail!("GITHUB_TOKEN is empty");
+              }
+
+              let root = PathBuf::from(std::env::var("RUNNER_TEMP")?)
+                  .join(format!("zed-ghcr-live-{}", std::process::id()));
+              let _ = fs::remove_dir_all(&root);
+              fs::create_dir_all(root.join("src"))?;
+              fs::write(root.join("LICENSE"), b"MIT\n")?;
+              fs::write(root.join("src/payload.txt"), b"live-ghcr-roundtrip\n")?;
+
+              let manifest_text = r#"
+          [package]
+          org = "zed-pkg-test"
+          name = "ghcr-fallback-canary"
+          version = "0.0.1"
+          description = "Live GHCR fallback canary"
+          license = "MIT"
+
+          [package.repository]
+          vcs = "git"
+          url = "https://github.com/zed-pkg-test/ghcr-fallback-canary"
+
+          [package.artifacts]
+          github_packages = true
+          github_release = false
+          "#;
+              fs::write(root.join(".zpkg.toml"), manifest_text)?;
+              let manifest = Manifest::parse(manifest_text)?;
+              let packed = pack(&root, &manifest, Some(&root.join("out")))?;
+              let tag = "zed-live-roundtrip";
+
+              let outcome = mirror_packed_ghcr(&manifest, &packed, tag, None)?;
+              match outcome {
+                  GhcrOutcome::Uploaded { .. } => {}
+                  GhcrOutcome::Skipped(reason) => bail!("GHCR upload unexpectedly skipped: {reason}"),
+              }
+
+              let identity = parse_github_identity(&manifest.package.repository.url)
+                  .context("GitHub identity")?;
+              let manifest_url = ghcr_manifest_url(&identity, tag);
+              let downloaded = root.join("downloaded.tar.gz");
+              let client = reqwest::blocking::Client::builder()
+                  .user_agent("zed-pkg-test-ghcr-live-roundtrip")
+                  .build()?;
+              download_ghcr_layer(
+                  &client,
+                  Some(&token),
+                  &manifest_url,
+                  &downloaded,
+                  packed.size,
+                  packed.size.saturating_add(1024 * 1024),
+              )?;
+
+              let bytes = fs::read(&downloaded)?;
+              let got = hex_sha256(&bytes);
+              if got != packed.sha256 {
+                  bail!("GHCR roundtrip digest mismatch: got {got}, expected {}", packed.sha256);
+              }
+              Ok(())
+          }
+          RS
+
+      - name: Run live upload/download roundtrip against GHCR
+        working-directory: product/zed-cli
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -Eeuo pipefail
+          cargo test --locked --test ghcr_live_roundtrip -- --nocapture
+
+      - name: Retain exact-head evidence
+        if: ${{ always() }}
+        run: |
+          printf 'zed-cli-sha=%s\ncanary-sha=%s\n' "$ZED_CLI_SHA" "$GITHUB_SHA"
